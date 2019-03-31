@@ -20,6 +20,7 @@
 
 # +
 import time
+import gc
 
 import gym
 import math
@@ -50,19 +51,19 @@ class VPGNetwork(nn.Module):
         super(VPGNetwork, self).__init__()
         self.discrete_action = discrete_action
         self.layers = [nn.Linear(observation_dim, hidden_dims[0])]
-        self.add_module(f"layer{1}", self.layers[0])
+        self.add_module("layer0", self.layers[0])
         for i in range(0, len(hidden_dims)-1):
             self.layers.append(nn.Linear(hidden_dims[i], hidden_dims[i+1]))
-            self.add_module(f"layer{len(self.layers)}", self.layers[-1])
+            self.add_module(f"layer{i+1}", self.layers[-1])
         self.layers.append(nn.Linear(hidden_dims[-1], action_dim))
         self.add_module(f"layer{len(self.layers)}", self.layers[-1])
-    
+
     def _action_calculation(self, observation):
         if self.discrete_action:
             return F.softmax(observation, dim=0)
         else:
             return observation
-    
+
     def forward(self, observation):
         for layer in self.layers:
             observation = F.relu(layer(observation))
@@ -77,10 +78,9 @@ ACTION_DIM = env.action_space.n
 policy = VPGNetwork(OBSERVATION_DIM, ACTION_DIM, [32, 32], True)
 
 optimizer = optim.RMSprop(policy.parameters(), lr=0.005)
+
+
 # -
-
-list(policy.modules())
-
 
 def choose_action(obs):
     act_probs = policy(torch.as_tensor(obs).float())
@@ -101,50 +101,63 @@ def act(n_episodes):
     env.close()
 
 
+def loss_function(act_probs, acts, rews):
+    log_probs = (torch.zeros(act_probs.shape).scatter_(1, acts, 1) * torch.log(act_probs)).sum(dim=1)
+    return -torch.mean(log_probs * rews)
+
+
+def reward_to_go(episode_rewards):
+    episode_len = len(episode_rewards)
+    rewards_to_go = [episode_rewards[-1]]
+    for i in range(1, episode_len):
+        rewards_to_go[i] = episode_rewards[-(i+1)] + rewards_to_go[i-1]
+    return reverse(rewards_to_go)
+
+
 def do_one_epoch():
     trajectories_rewards = []
     trajectories_acts = []
     trajectories_act_probs = []
     trajectories_obs = []
     while True:
-        # rendering = i == 1
         obs = env.reset()
         done = False
         episode_len = 0
+        episode_rewards = []
         while not done:
             action, act_probs = choose_action(obs)
             trajectories_act_probs.append(act_probs)
             trajectories_acts.append([action])
             trajectories_obs.append(obs)
             episode_len += 1
-            obs, _, done, _ = env.step(action)
-        trajectories_rewards += reversed(range(0, episode_len))
-        
+            obs, reward, done, _ = env.step(action)
+            episode_rewards.append(reward)
+
+        trajectories_rewards += reward_to_go(episode_rewards)
+
         if len(trajectories_obs) > BATCH_SIZE:
             break
 
-    rews = torch.as_tensor(trajectories_rewards).float()
-    act_probs = torch.stack(trajectories_act_probs).float()
-    acts = torch.as_tensor(trajectories_acts).long()
-    obs = torch.as_tensor(trajectories_obs).float()
-
-    log_probs = (torch.zeros(act_probs.shape).scatter_(1, acts, 1) * torch.log(act_probs)).sum(dim=1)
-    loss = -torch.mean(log_probs * rews)
+    loss = loss_function(
+        torch.stack(trajectories_act_probs).float(),
+        torch.as_tensor(trajectories_acts).long(),
+        torch.as_tensor(trajectories_rewards).float(),
+    )
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    plot_grad_flow(policy.named_parameters())
+    #plot_grad_flow(policy.named_parameters())
 
-    avg_reward = torch.mean(rews)
+    avg_reward = np.mean(trajectories_rewards)
     return avg_reward
 
 
 def plot_grad_flow(named_parameters):
     '''Plots the gradients flowing through different layers in the net during training.
     Can be used for checking for possible gradient vanishing / exploding problems.
-    
-    Usage: Plug this function in Trainer class after loss.backwards() as 
+
+    Usage: Plug this function in Trainer class after loss.backwards() as
     "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
     ave_grads = []
     max_grads= []
@@ -181,9 +194,9 @@ def train(epochs):
         avg_rew = do_one_epoch()
         epoch_avg_rewards.append(avg_rew)
         print(f"epoch{i} done, avg_reward: {avg_rew}")
+        if 1 % 10 == 0:
+            print(gc.collect)
     plt.plot(epoch_avg_rewards)
 
-
-act(4)
 
 train(50)
